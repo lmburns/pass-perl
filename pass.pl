@@ -5,28 +5,26 @@ use warnings;
 use feature 'say';
 
 use Readonly;
-use File::Basename;
-use Git::Repository;
-use Git;
-use Getopt::Long;
+use Cwd              qw(cwd abs_path);
+use File::Basename   qw(basename dirname);
 
+use Getopt::Long     qw(GetOptions);
+use Pod::Usage       qw(pod2usage);
+use Git::Repository;
+# use Crypt::Random    qw(makerandom);
+
+# use Git;
 # PerlX::bash
 
-# BEGIN {
-#   select(STDERR);
-#   $| = 1;
-#   select(STDOUT);
-#   $| = 1;
-# }
-
-# umask $ENV{'PASSWORD_STORE_UMASK'} // 077;
-
-sub createDir {
-  my ($dir,$perm) = @_;
-    unless(-d $dir) {
-      mkdir $dir,$perm or die "$!";
-   }
+BEGIN {
+  select(STDERR);
+  $| = 1;
+  select(STDOUT);
+  $| = 1;
 }
+
+my $prog = basename $0;
+# umask $ENV{'PASSWORD_STORE_UMASK'} // 077;
 
 my @GPG_OPTS=( $ENV{'PASSWORD_STORE_GPG_OPTS'} // '',
   "--quiet", "--yes", "--compress-algo=none", "--no-encrypt-to" );
@@ -49,14 +47,11 @@ $ENV{'GIT_CEILING_DIRECTORIES'} = "$PREFIX/..";
 # HELPER FUNCTIONS
 #
 
-my $tgit = '/Users/lucasburns/mybin/perl/testgit';
-my $ggit = '/Users/lucasburns/projects/github';
-
 my $INNER_GIT_DIR;
 
 sub set_git {
   # FIX: get user input
-  # FIX: add glob
+  # FIX: add glob?
   # $xy =~ /$xx=~s|\/$||r*/) --- @{[ $tt=~s|/$||r ]} -- @{[ $PREFIX=~s|/$||r ]}*"
   $INNER_GIT_DIR = dirname(@_);
   while (! -d $INNER_GIT_DIR && dirname($INNER_GIT_DIR) =~ /$PREFIX=~s|\/$||r*/ ) {
@@ -68,7 +63,7 @@ sub set_git {
 
 sub git_add_file {
   $INNER_GIT_DIR ne "" || return;
-  $INNER_GIT_DIR->run( add => $_[0]) || return;
+  $INNER_GIT_DIR->run( add => $_[0] ) || return;
   $INNER_GIT_DIR->run( status => '--porcelain', $_[0] ) || return;
   git_commit($_[1]);
 }
@@ -76,9 +71,9 @@ sub git_add_file {
 sub git_commit {
   my $sign = "";
   $INNER_GIT_DIR ne "" || return;
-  my $tmpo = $INNER_GIT_DIR->run( config => '--bool', '--get', 'pass.signcommits');
+  my $tmpo = $INNER_GIT_DIR->run( config => '--bool', '--get', 'pass.signcommits' );
   $tmpo eq 'true' && ( $sign = '-S' );
-  $INNER_GIT_DIR->run( commit => $sign, '-m', $_[0]);
+  $INNER_GIT_DIR->run( commit => $sign, '-m', $_[0] );
 }
 
 sub yesno {
@@ -103,29 +98,161 @@ sub verify_file {
     $fingerprint =~ /^[\dA-F]{40}$/gm || next;
     if($fingerprints =~ /.*$fingerprint.*/){$found = 1; last};
   }
-  $found == 1 || die "Signture for $_[0] is invalid";
+  $found == 1 || die "Signature for $_[0] is invalid";
 }
 
-# verify_file('/Users/lucasburns/mybin/perl/testgit/test.txt');
+my @GPG_RECIPIENT_ARGS = ();
+my @GPG_RECIPIENTS = ();
+my $gpg_id;
+
+sub set_gpg_recipients {
+  if (defined $ENV{'PASSWORD_STORE_SIGNING_KEY'}) {
+    for $gpg_id (split(/\h+/, $ENV{'PASSWORD_STORE_SIGNING_KEY'})) {
+      push @GPG_RECIPIENT_ARGS, ("-r", "$gpg_id");
+      push @GPG_RECIPIENTS, "$gpg_id";
+    }
+   return
+  }
+
+  my $current = "$PREFIX/$_[0]";
+  while($current ne $PREFIX && ! -f "$current/.gpg-id") {
+    $current = dirname($current);
+  }
+  $current = "$current/.gpg-id";
+  if (! -f $current) {
+    pod2usage(  -message => "$prog init your-gpg-id",
+                -section => [qw(SYNOPSIS)],
+                -output  => \*STDERR,
+                -exitval => 1);
+  }
+  verify_file("$current");
+  open(my $fh, '<', $current) or die "Couldn't open '$current' $!";
+  while (my $gpg_id = <$fh>) {
+    chomp($gpg_id);
+    push @GPG_RECIPIENT_ARGS, ("-r", "$gpg_id");
+    push @GPG_RECIPIENTS, "$gpg_id";
+  }
+  close $fh;
+}
+
+sub reencrypt_path {
+  my ($prev_gpg_recipients, $gpg_keys, $current_keys) = ("", (), "");
+  my ($index, $passfile, @s);
+  defined $ENV{'PASSWORD_STORE_GPG_OPTS'} ? @s = $ENV{'PASSWORD_STORE_GPG_OPTS'} : (@s = ());
+  # my $groups = qx($GPG @s --list-config --with-colons) =~ /^cfg:group:.*/;
+  my $groups = qx($GPG @s --list-config --with-colons group);
+
+  # FIX: while read loop here
+  my $passfile_dir = dirname($passfile);
+  $passfile_dir = basename($passfile_dir);
+  my $passfile_display = basename($passfile);
+  $passfile_display =~ s/\.gpg//;
+  my $passfile_temp = join(".", "${passfile}.tmp", map { int(rand($_)) } (9999) x 4) . ".--";
+
+  set_gpg_recipient("$passfile_dir");
+  if ($prev_gpg_recipients ne @GPG_RECIPIENTS) {
+    for my $index (0 .. $#GPG_RECIPIENTS) {
+      my $r = $GPG_RECIPIENTS[$index] =~ s|[/&]|\\$&|gr;
+      # DISCOVER: group has to be email?
+      my $group = (split /\n/, $groups)[0] =~ s{^(cfg:group:$r:\K(.*)$)}{$1}gr;
+
+      $group eq "" && next;
+      push(@GPG_RECIPIENTS, split /;/, $groups);
+      delete $GPG_RECIPIENTS[$index];
+    }
+    $gpg_keys = qx($GPG @s --list-keys --with-colons @GPG_RECIPIENTS);
+    my @gpg_keys = split(/\s/,
+      join(" ", $gpg_keys =~ /^sub(?::[^:]*){3}:([^:]*)(?::[^:]*){6}:[[:alpha:]]*e[[:alpha:]]*:.*/mg));
+    $gpg_keys = join(" ", do { my %ref; grep { !$ref{$_}++ } @gpg_keys });
+    # FIX: locale sort (if needed)
+  }
+  $current_keys = qx($GPG -v --no-secmem-warning --no-permission-warning --decrypt --list-only --keyid-format long $passfile 2>&1);
+  my @current_keys = split(/\s/, join(" ", $current_keys =~ /^gpg: public key is ([\dA-F]+)$/m));
+  $current_keys = join(" ", do { my %ref; grep { !$ref{$_}++ } @current_keys });
+
+  if ( $gpg_keys ne $current_keys ) {
+    say "$passfile_display: reencrypting to " . $gpg_keys =~ s/\n//rg ;
+  };
+}
+
+my $gpg_keys = "";
+my $passfile = "/Users/lucasburns/mybin/perl/testgit/cou.gpg";
+my $pre = "/Users/lucasburns/mybin/perl/testgit";
+my $passfile_display = basename($passfile);
+$passfile_display =~ s/\.gpg//;
+say "$passfile";
+my @sa = (9999) x 4;
+my $pp = join(".", "${passfile}.tmp", map { int(rand($_)) } (9999) x 4) . ".--";
+my $prev_gpg = "";
+my @gpg_rec = qw(burnsac@me.com asdf@gmail.com);
+my $groups = qx($GPG --list-config --with-colons group);
+
+##
+$gpg_keys = qx($GPG --list-keys --with-colons burnsac\@me.com);
+my @gpg_keys = split(/\s/,
+  join(" ", $gpg_keys =~ /^sub(?::[^:]*){3}:([^:]*)(?::[^:]*){6}:[[:alpha:]]*e[[:alpha:]]*:.*/mg));
+$gpg_keys = join(" ", do { my %ref; grep { !$ref{$_}++ } @gpg_keys });
+
+my $current_keys = qx($GPG -v --no-secmem-warning --no-permission-warning --decrypt --list-only --keyid-format long $passfile 2>&1);
+
+my @current_keys = split(/\s/, join(" ", $current_keys =~ /^gpg: public key is ([\dA-F]+)$/m));
+$current_keys = join(" ", do { my %ref; grep { !$ref{$_}++} @current_keys });
+
+say $gpg_keys;
+say $current_keys;
+
+if ( $gpg_keys ne $current_keys ) {
+  say "$passfile_display: reencrypting to " . $gpg_keys =~ s/\n//rg;
+  my $f = qx($GPG -d $passfile);
+  say $f;
+};
 
 ###############################################
 
-# verify_file() {
-# 	[[ -n $PASSWORD_STORE_SIGNING_KEY ]] || return 0
-# 	[[ -f $1.sig ]] || die "Signature for $1 does not exist."
-# 	local fingerprints="$($GPG $PASSWORD_STORE_GPG_OPTS --verify --status-fd=1 "$1.sig" "$1" 2>/dev/null
-# | sed -n 's/^\[GNUPG:\] VALIDSIG \([A-F0-9]\{40\}\) .* \([A-F0-9]\{40\}\)$/\1\n\2/p')"
-# 	local fingerprint found=0
-# 	for fingerprint in $PASSWORD_STORE_SIGNING_KEY; do
-# 		[[ $fingerprint =~ ^[A-F0-9]{40}$ ]] || continue
-# 		[[ $fingerprints == *$fingerprint* ]] && { found=1; break; }
+# 			$GPG -d "${GPG_OPTS[@]}" "$passfile" | $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile_temp" "${GPG_OPTS[@]}" &&
+# 			mv "$passfile_temp" "$passfile" || rm -f "$passfile_temp"
+# 		fi
+# 		prev_gpg_recipients="${GPG_RECIPIENTS[*]}"
+# 	done < <(find "$1" -path '*/.git' -prune -o -iname '*.gpg' -print0)
+# }
+# check_sneaky_paths() {
+# 	local path
+# 	for path in "$@"; do
+# 		[[ $path =~ /\.\.$ || $path =~ ^\.\./ || $path =~ /\.\./ || $path =~ ^\.\.$ ]] && die "Error: You've attempted to pass a sneaky path to pass. Go home."
 # 	done
-# 	[[ $found -eq 1 ]] || die "Signature for $1 is invalid."
 # }
 
 
+##################################3
+# my @gfs = qw(words added);
+# my @afs = ();
+# my $tpref = '/Users/lucasburns/mybin/perl/testgit';
 
+# sub set_gpg_recipient {
+#   my $current = "$tpref/$_[0]";
+#   while ($current ne $tpref && ! -f "$current/.gpg-id") {
+#     $current = dirname("$current");
+#   }
+#   $current = "$current/.gpg-id";
+#   if (! -f $current) {
+#     pod2usage(  -message => "$prog init your-gpg-id before using the password-store",
+#                 -section => [qw(SYNOPSIS)],
+#                 -output  => \*STDERR,
+#                 -exitval => 1);
+#   }
+#   verify_file("$current");
+#   open my $fh, '<', $current or die "Couldn't open '$current' $!";
+#   while (my $gpg_id = <$fh>) {
+#     chomp($gpg_id);
+#     push @GPG_RECIPIENT_ARGS, ("-r", "$gpg_id");
+#     push @GPG_RECIPIENTS, "$gpg_id";
+#   }
+#   close $fh;
+#   say "@GPG_RECIPIENT_ARGS";
+# }
 
+# set_gpg_recipient('fold1/fold2');
+##################################3
 
 
 
@@ -156,3 +283,22 @@ sub verify_file {
 #         return -t *STDIN;
 #     }
 # }
+
+
+__DATA__
+
+=head1 NAME
+
+  pass-perl.pl
+
+=head1 DESCRIPTION
+
+  An implementation of the password-manager 'pass' in Perl.
+
+=head1 SYNOPSIS
+
+  pass-perl -h
+
+  [-help -h]      Print out usage information
+
+=cut
