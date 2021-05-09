@@ -2,13 +2,18 @@
 
 use strict;
 use warnings;
-use feature 'say';
+use feature qw(say);
+use experimental qw(switch);
+
+use Data::Dumper qw(Dumper);
 
 # use Readonly;
 # use IO::Null;
 # use IO::Handle;
 # use GnuPG::Interface;
 # use MIME::Base64;
+
+# use Scalar::MoreUtils qw( define empty );
 
 use Cwd qw(cwd abs_path getcwd);
 use File::Basename qw(basename dirname);
@@ -45,7 +50,8 @@ if     ( defined $ENV{'GPG_AGENT_INFO'} || $GPG eq "gpg2" ) {
     push( @GPG_OPTS, '--batch', '--use-agent' );
 }
 
-my $PREFIX           = $ENV{'PASSWORD_STORE_DIR'} // "$ENV{HOME}/.password-store";
+# my $PREFIX           = $ENV{'PASSWORD_STORE_DIR'} // "$ENV{HOME}/.password-store";
+my $PREFIX = "/Users/lucasburns/mybin/perl/testgit";
 my $EXTENSIONS       = $ENV{'PASSWORD_STORE_EXTENSIONS_DIR'} // "$PREFIX/.password-store";
 my $X_SELECTION      = $ENV{'PASSWORD_STORE_X_SELECTION'}      // "clipboard";
 my $CLIP_TIME        = $ENV{'PASSWORD_STORE_CLIP_TIME'}        // 45;
@@ -99,18 +105,16 @@ sub yesno {
 
     # FIX: make exit status // -t STDIN
     -t 0 && chomp( my $ans = <STDIN> );
-    die "Exiting: $!\n" unless $ans =~ /[Yy](es)?/;
+    die RED "Exiting:", RESET "$!\n" unless $ans =~ /[Yy](es)?/;
 }
 
 sub verify_file {
     defined $ENV{'PASSWORD_STORE_SIGNING_KEY'} || return 0;
-    ( -f "$_[0].sig" ) || die "Signature for $_[0] doesn't exist";
+    ( -f "$_[0].sig" ) || die RED "Error: ", RESET "Signature for $_[0] doesn't exist\n";
     my @s;
 
     # FIX: password-store opts array
-    defined $ENV{'PASSWORD_STORE_GPG_OPTS'}
-      ? @s = $ENV{'PASSWORD_STORE_GPG_OPTS'}
-      : ( @s = () );
+    @s = defined $ENV{'PASSWORD_STORE_GPG_OPTS'} ? $ENV{'PASSWORD_STORE_GPG_OPTS'} : ();
     my $fingerprints =
       qx($GPG @s --verify --status-fd=1 "$_[0].sig" "$_[0]" 2>/dev/null);
     $fingerprints =~
@@ -121,7 +125,7 @@ sub verify_file {
         $fingerprint =~ /^[\dA-F]{40}$/gm || next;
         if ( $fingerprints =~ /.*$fingerprint.*/ ) { $found = 1; last }
     }
-    $found == 1 || die "Signature for $_[0] is invalid";
+    $found == 1 || die RED "Error: ", RESET "Signature for $_[0] is invalid\n";
 }
 
 my @GPG_RECIPIENT_ARGS = ();
@@ -151,7 +155,7 @@ sub set_gpg_recipients {
     );
   }
   verify_file("$current");
-  open( my $fh, '<', $current ) or die "Couldn't open '$current' $!";
+  open( my $fh, '<', $current ) or die RED "Error: ", RESET "Couldn't open '$current' $!\n";
   while ( my $gpg_id = <$fh> ) {
     chomp($gpg_id);
     push @GPG_RECIPIENT_ARGS, ( "-r", "$gpg_id" );
@@ -163,9 +167,7 @@ sub set_gpg_recipients {
 sub reencrypt_path {
   my ( $prev_gpg_recipients, $gpg_keys, $current_keys, @passfiles ) = ( "", (), "", ());
   my ( $index,               $passfile, @s );
-  defined $ENV{'PASSWORD_STORE_GPG_OPTS'}
-    ? @s = $ENV{'PASSWORD_STORE_GPG_OPTS'}
-    : ( @s = () );
+  @s = defined $ENV{'PASSWORD_STORE_GPG_OPTS'} ? $ENV{'PASSWORD_STORE_GPG_OPTS'} : ();
 
   # my $groups = qx($GPG @s --list-config --with-colons) =~ /^cfg:group:.*/;
   my $groups = qx($GPG @s --list-config --with-colons group);
@@ -229,7 +231,7 @@ sub reencrypt_path {
 sub check_sneaky_paths {
   for my $path (@_) {
     $path =~ m!(/\.{2}$)|(^\.{2}/)|(\.{2}/)|(^\.{2}$)!
-      && die "Error: Sneaky path was passed: $_\n";
+      && die RED "Error: ", RESET "Sneaky path was passed: $_\n";
   }
 }
 
@@ -296,14 +298,14 @@ sub tmpdir {
     ($SECURE_TMPDIR ne "" && -d $SECURE_TMPDIR && $DARWIN_RAMDISK_DEV ne "") || return;
     system("umount $SECURE_TMPDIR");
     system("disutil quiet eject $DARWIN_RAMDISK_DEV");
-    unlink($SECURE_TMPDIR) or die "Couldn't delete $SECURE_TMPDIR\n";
+    unlink($SECURE_TMPDIR) or die RED "Error: ", RESET "Couldn't delete $SECURE_TMPDIR\n";
   };
   $SIG{INT} = \&unmount_tmpdir;
   $SIG{TERM} = \&unmount_tmpdir;
   $SIG{EXIT} = \&unmount_tmpdir;
-  die "Error: could not create ramdisk" if $DARWIN_RAMDISK_DEV eq "";
-  system("newfs_hfs -M 700 $DARWIN_RAMDISK_DEV &>/dev/null") || die "Error: could not create FS on ramdisk\n";
-  system("mount -t hfs -o noatime -o nobrowse $DARWIN_RAMDISK_DEV $SECURE_TMPDIR") || die "Error: could not mount FS on ramdisk\n"
+  die RED "Error: ", RESET " could not create ramdisk\n" if $DARWIN_RAMDISK_DEV eq "";
+  system("newfs_hfs -M 700 $DARWIN_RAMDISK_DEV &>/dev/null") || die "Error: ", RESET "could not create FS on ramdisk\n";
+  system("mount -t hfs -o noatime -o nobrowse $DARWIN_RAMDISK_DEV $SECURE_TMPDIR") || die RED "Error: ", RESET "could not mount FS on ramdisk\n"
 }
 
 # local *prnt = sub {
@@ -326,53 +328,27 @@ sub version {
   say BOLD BLUE "=" x $wchar;
 }
 
+sub cmd_init {
+  my ($id_path, %opts, $command);
+  # GetOptions("path|p=s" => \my $opts);
+  my @init_opts = ("help|h+", "path|p=s");
+  GetOptions(\%opts => @init_opts);
+  foreach (keys(%opts)) {
+    # TIP: can only use when if no var name supplied
+    when(/(p|path)/) { $id_path = $opts{'path'} }
+  };
+  # use this in case this sub is called with no args
+  $command = defined($ARGV[0]) ? $ARGV[0] : '';
+  print scalar(%opts);
+  die GREEN "Usage: ", RESET "$prog $command [{--path,-p} subfolder] gpg-id\n" if ((0 == keys (%opts)) || $opts{'help'});
+  check_sneaky_paths("$id_path") if $id_path ne "";
+  die RED "Error: ", GREEN "$PREFIX/$id_path ", RESET "exists but is not a directory\n" if ( $id_path ne "" && !-d "$PREFIX/$id_path" && -e _ );
 
-#
-##### TESTING AREA ######
-#
+  # my $gpg_id = "$PREFIX/$id_path/.gpg_id";
+  # set_git("$gpg_id");
+}
 
-my $gpg_keys         = "";
-my $passfile         = "/Users/lucasburns/mybin/perl/testgit/cou.gpg";
-my $pre              = "/Users/lucasburns/mybin/perl/testgit";
-
-my $passfile_display = basename($passfile);
-$passfile_display =~ s/\.gpg//;
-
-my @sa = (9999) x 4;
-my $pp =
-  join( ".", "${passfile}.tmp", map { int( rand($_) ) } (9999) x 4 ) . ".--";
-my $prev_gpg = "";
-my @gpg_rec  = qw(burnsac@me.com asfg@gmail.com);
-my $groups   = qx($GPG --list-config --with-colons group);
-
-##
-$gpg_keys = qx($GPG --list-keys --with-colons burnsac\@me.com);
-my @gpg_keys = split(
-    /\s/,
-    join( " ",
-        $gpg_keys =~
-/^sub(?::[^:]*){3}:([^:]*)(?::[^:]*){6}:[[:alpha:]]*e[[:alpha:]]*:.*/mg
-    )
-);
-$gpg_keys = join(
-    " ",
-    do {
-        my %ref;
-        grep { !$ref{$_}++ } @gpg_keys;
-    }
-);
-
-my $current_keys =
-qx($GPG -v --no-secmem-warning --no-permission-warning --decrypt --list-only --keyid-format long $passfile 2>&1);
-
-my @current_keys = split( /\s/,
-    join( " ", $current_keys =~ /^gpg: public key is ([\dA-F]+)$/m ) );
-$current_keys = join(" ",
-    do {
-        my %ref;
-        grep { !$ref{$_}++ } @current_keys;
-    }
-);
+cmd_init(@_);
 
 #######################
 # use File::Find qw(find);
@@ -395,7 +371,95 @@ $current_keys = join(" ",
 #     last;
 #   }
 # };
+######################
+# close FIND or warn $! ?
+#   "Error closing find pipe: $!" :
+#   "find exited with non-zero exit status: $?";
+###############################################
+# my @gfs = qw(words added);
+# my @afs = ();
+# my $tpref = '/Users/lucasburns/mybin/perl/testgit';
 
+# sub set_gpg_recipient {
+#   my $current = "$tpref/$_[0]";
+#   while ($current ne $tpref && ! -f "$current/.gpg-id") {
+#     $current = dirname("$current");
+#   }
+#   $current = "$current/.gpg-id";
+#   if (! -f $current) {
+#     pod2usage(  -message => "$prog init your-gpg-id before using the password-store",
+#                 -section => [qw(SYNOPSIS)],
+#                 -output  => \*STDERR,
+#                 -exitval => 1);
+#   }
+#   verify_file("$current");
+#   open my $fh, '<', $current or die "Couldn't open '$current' $!";
+#   while (my $gpg_id = <$fh>) {
+#     chomp($gpg_id);
+#     push @GPG_RECIPIENT_ARGS, ("-r", "$gpg_id");
+#     push @GPG_RECIPIENTS, "$gpg_id";
+#   }
+#   close $fh;
+#   say "@GPG_RECIPIENT_ARGS";
+# }
+
+# set_gpg_recipient('fold1/fold2');
+##################################3
+
+## STDIN TTY #############################################
+# my $isa_tty = -t STDIN && (-t STDOUT || !(-f STDOUT || -c STDOUT));
+
+# sub is_interactive {
+#     my ($out_handle) = (@_, select);    # Default to default output handle
+
+#     # Not interactive if output is not to terminal...
+#     return 0 if not -t $out_handle;
+
+#     # If *ARGV is opened, we're interactive if...
+#     if ( tied(*ARGV) or defined(fileno(ARGV)) ) { # IO::Interactive::Tiny: this is the only relavent part of Scalar::Util::openhandle() for 'openhandle *ARGV'
+#         # ...it's currently opened to the magic '-' file
+#         return -t *STDIN if defined $ARGV && $ARGV eq '-';
+
+#         # ...it's at end-of-file and the next file is the magic '-' file
+#         return @ARGV>0 && $ARGV[0] eq '-' && -t *STDIN if eof *ARGV;
+
+#         # ...it's directly attached to the terminal
+#         return -t *ARGV;
+#     }
+
+#     # If *ARGV isn't opened, it will be interactive if *STDIN is attached
+#     # to a terminal.
+#     else {
+#         return -t *STDIN;
+#     }
+# }
+
+############################
+# my $gnupg = GnuPG::Interface->new();
+
+# $gnupg->options->hash_init( armor    => 1,
+#                             recipients => [ 'burnsac@me.com' ],
+#                             meta_interactive => 0 ,
+#                           );
+
+# my ($input, $output) = ( IO::Handle->new(), IO::Handle->new() );
+
+# my $handles = GnuPG::Handles->new( stdin    => $input,
+#                                    stdout   => $output );
+
+# my $pid = $gnupg->encrypt( handles => $handles );
+# my $pid = $gnupg->sign( handles => $handles );
+
+# print $input @original_plaintext;
+
+# close $input;
+
+# my @ciphertext = <$output>;  # reading the output
+
+# waitpid $pid, 0;  # clean up the finished GnuPG process
+
+# say "@ciphertext";
+############################
 
 __DATA__
 
