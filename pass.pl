@@ -309,7 +309,6 @@ sub c2 {
 }
 
 # clip help {{{
-#######################
 # pkill -f "^$sleep_argv0" 2>/dev/null && sleep 0.5
 # local before="$(pbpaste | $BASE64)"
 # echo -n "$1" | pbcopy
@@ -320,7 +319,7 @@ sub c2 {
 #   echo "$before" | $BASE64 -d | pbcopy
 # ) >/dev/null 2>&1 & disown
 # echo "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
-#######################
+
 # my ($now, $decode_tmp);
 # my $cmd = 'system("exec -a $sleep_argv0 sleep $CLIP_TIME");
 # $now = encode_base64(pbpaste());
@@ -328,7 +327,8 @@ sub c2 {
 # $decode_tmp = decode_base64(pbpaste());
 # pbcopy($decode_tmp);';
 # my $proc1 = Proc::Background->new("$cmd");
-#######################
+
+
 # unless ($$ = fork) {
 # die "cannot fork child: $!";
 # unless (fork) {
@@ -338,7 +338,7 @@ sub c2 {
 # exit 0;
 # }
 # waitpid($$, 0);
-#######################
+
 # my $pid = fork();
 # die "unable to fork: $!" unless defined($pid);
 # if (!$pid) {  # child
@@ -346,14 +346,15 @@ sub c2 {
 # exec("sleep 2");
 # die "unable to exec: $!";
 # }
-#######################
+#
 # $show_cmd && print "% $cmd\n" ;
 # system $cmd or die "exec() failed: $!\n" ;
 # printf "Session end pid to kill %d\n", $pid;
 # kill 9, -$pid;
 # waitpid $pid, 0;
 # printf "End of the script.\n";
-#######################
+
+
   # local $SIG{CHLD} = 'IGNORE';
 # if(!defined($$ = fork())) {
 #   die "Cannot fork a child: $!";
@@ -367,12 +368,11 @@ sub c2 {
 # }
 # 1;
 # say $$;
-#######################
+
 # say "PID $$";
 # my $pid = fork();
 # die if not defined $pid;
 # say "PID $$ ($pid)";
-#######################
 # }}} clip help
 
 # qrcode {{{
@@ -461,7 +461,7 @@ sub cmd_init {
     when(/p|path/) { $id_path = $opts{'path'} }
   };
   # use this in case this sub is called with no args
-  $command = defined($ARGV[0]) ? $ARGV[0] : '';
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
   cdie(GREEN "Usage: ", RESET "$prog $command [{--path,-p} subfolder] gpg-id") if ((0 == keys (%opts)) || $opts{'help'});
   check_sneaky_paths("$id_path") if $id_path ne "";
   cdie(GREEN "$PREFIX/$id_path ", RESET "exists but is not a directory") if ( $id_path ne "" && !-d "$PREFIX/$id_path" && -e _ );
@@ -469,7 +469,7 @@ sub cmd_init {
   # my $gpg_id = "$PREFIX/$id_path/.gpg_id";
   # set_git("$gpg_id");
   # CHECK: argv[0]
-  if (scalar(@ARGV) == 1 && $ARGV[1] eq ''){
+  if (scalar(@ARGV) == 1 && $ARGV[0] eq ''){
     cdie(GREEN "$gpg_id", RESET "does not exist, therefore can't be removed") if (! -f $gpg_id);
     unlink($gpg_id) || exit 1;
     if ($INNER_GIT_DIR ne ""){
@@ -519,14 +519,11 @@ sub cmd_show {
     when(/q|qrcode/) { $selected_line = $opts{'qrcode'} // 1 };
     when(/c|clip/)   { $selected_line = $opts{'clip'} // 1 };
   }
-  say $ARGV[0];
-  say $ARGV[1];
-  say $selected_line;
-  # while (my ($k,$v)=each %opts){print "$k $v\n"};
-  $command = defined($ARGV[0]) ? $ARGV[0] : '';
+  # $command = defined($ARGV[0]) ? $ARGV[0] : '';
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
   cdie(GREEN "Usage: ", RESET "$prog $command [{--clip,-c} line-number] [{--qrcode,-q} line-number] [pass-name]") if ( $? != 0 || ($opts{'qrcode'} && $opts{'clip'}) );
   my $pass;
-  my $path = "$ARGV[1]";
+  my $path = "$ARGV[0]";
   my $passfile = "$PREFIX/$path.gpg";
   check_sneaky_paths("$path");
   if (-f $passfile) {
@@ -552,8 +549,8 @@ sub cmd_show {
     } else {
       say "@{[$path =~ s{(.*)/}{$1}r]}"
     }
-    my $tmp_out = qx("tree -C -l --noreport $PREFIX/$path | tail -n +2");
-    # sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g'
+    my $tmp_tree = qx(tree -C -l --noreport $PREFIX/$path | tail -n +2);
+    say $tmp_tree =~ s/.gpg(\e)?//gr;
   } elsif ($path eq "") {
     cdie("passord store is empty. Try 'pass init'");
   } else {
@@ -562,9 +559,44 @@ sub cmd_show {
 }
 # }}} cmd_show
 
+# cmd_find {{{
+sub cmd_find {
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
+  cdie(GREEN, "Usage: ", RESET, "$prog $command pass-names ..") if (scalar(@ARGV) == 0);
+  say "Search Terms: ", join(",", @ARGV);
+  my $terms = "*" . join("*|*", @ARGV) . "*";
+  my $tmp_tree = qx(tree -C -l --noreport -P '$terms' --prune --matchdirs --ignore-case $PREFIX);
+  say $tmp_tree =~ s/.gpg(\e)?//gr;
+}
+# }}} cmd_find
+
+# cmd_grep {{{
+sub cmd_grep {
+  # my $command = defined($ARGV[0]) ? $ARGV[0] : '';
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
+  say $command;
+  # cdie(GREEN, "Usage: ", RESET, "$prog $command [GREPOPTS] pass-names ..") if (scalar(@ARGV) < 1);
+  my ($passfile, $grepresults, @passfiles);
+  local *wanted = sub {
+    $File::Find::prune = 1 if /^.git/;
+    push(@passfiles, $File::Find::name) if (-f && /^.*\.gpg\z/);
+  };
+  find( {wanted => \&wanted, follow => 1}, $PREFIX );
+
+  # my $grepresults = qx{$GPG -d @GPG_OPTS $passfile | rg --color=always @ARGV[1..$#_]};
+
+  # my $passfile_dir = (split /\//, $passfile)[-2];
+  # my $passfile_display = (split /\//, $passfile)[-1];
+  # $passfile_display =~ s/\.gpg//;
+
+  # say join "\n", @passfiles;
+}
+# }}} cmd_grep
+
+cmd_grep();
+
 # exec("pod2usage $0") if ((0 == keys (%opts)) || $opts{'help'});
 # while (my ($k,$v)=each %opts){print "$k $v\n"};
-
 
 __DATA__
 
