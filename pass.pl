@@ -22,31 +22,29 @@ use MIME::Base64;
 # use Scalar::MoreUtils qw( define empty );
 
 use POSIX;
-use Cwd qw(cwd abs_path getcwd);
-use File::Basename qw(basename dirname);
-use File::Copy qw(move);
+use Cwd                qw (cwd abs_path getcwd);
+use File::Basename     qw (basename dirname);
+use File::Copy         qw (move);
 use File::Find;
-use File::Path qw(make_path);
-use Proc::Find qw(find_proc proc_exists);
-use Term::ANSIColor qw(:constants colored);
+use File::Path         qw (make_path);
+use Proc::Find         qw (find_proc proc_exists);
+use Term::ANSIColor    qw (:constants colored);
 use Term::ReadKey;
+use String::ShellQuote qw (shell_quote);
 
 use Mac::Pasteboard;
-use Getopt::Long qw(GetOptions);
-use Pod::Usage qw(pod2usage);
-use Git::Repository;
+use Getopt::Long       qw (GetOptions);
+use Pod::Usage         qw (pod2usage);
 
 BEGIN {
     select(STDERR);
-    $| = 1;
+    local $| = 1;
     select(STDOUT);
-    $| = 1;
+    local $| = 1;
 }
 
 my $prog = (split /\//, $0)[-1];
 # umask $ENV{'PASSWORD_STORE_UMASK'} // 077;
-
-sub cdie { die RED "Error: ", RESET @_, "\n"; };
 
 my @GPG_OPTS = (
     $ENV{'PASSWORD_STORE_GPG_OPTS'} // '',
@@ -54,6 +52,7 @@ my @GPG_OPTS = (
 );
 my $GPG = "gpg";
 $ENV{'GPG_TTY'} = $ENV{'GPG_TTY'} // "$ENV{tty}";
+# inversed exit code
 unless ( system('which gpg2 >/dev/null') ) { $GPG = 'gpg2' }
 if     ( defined $ENV{'GPG_AGENT_INFO'} || $GPG eq "gpg2" ) {
     push( @GPG_OPTS, '--batch', '--use-agent' );
@@ -75,52 +74,55 @@ $ENV{'GIT_CEILING_DIRECTORIES'} = "$PREFIX/..";
 #
 
 my $INNER_GIT_DIR;
+my $SECURE_TMPDIR;
 
 # set_git {{{
 sub set_git {
  # FIX: get user input
  # FIX: add glob?
  # $xy =~ /$xx=~s|\/$||r*/) --- @{[ $tt=~s|/$||r ]} -- @{[ $PREFIX=~s|/$||r ]}*"
-    $INNER_GIT_DIR = dirname(@_);
-    while ( !-d $INNER_GIT_DIR && dirname($INNER_GIT_DIR) =~ /$PREFIX=~s|\/$||r*/ ) {
-        $INNER_GIT_DIR = dirname($INNER_GIT_DIR);
-        chomp( my $tmp = `git -C $INNER_GIT_DIR rev-parse --is-inside-work-tree 2>/dev/null` );
-        $tmp eq "true"
-          ? $INNER_GIT_DIR = Git::Repository->new( work_tree => $INNER_GIT_DIR )
-          : ( $INNER_GIT_DIR = '' );
-    }
+ # /$PREFIX=~s|\/$||r*/
+  $INNER_GIT_DIR = dirname(@_);
+  $PREFIX =~ s|/$||;
+  while ( ! -d $INNER_GIT_DIR && dirname($INNER_GIT_DIR) eq $PREFIX ) {
+    $INNER_GIT_DIR = dirname($INNER_GIT_DIR);
+  }
+
+  chomp( my $tmp = `git -C $INNER_GIT_DIR rev-parse --is-inside-work-tree 2>/dev/null` );
+  $INNER_GIT_DIR = '' unless($tmp eq "true");
 }
 # }}} set_git
 
 # git_add_file {{{
 sub git_add_file {
-    $INNER_GIT_DIR ne "" || return;
-    $INNER_GIT_DIR->run( add    => $_[0] )                || return;
-    $INNER_GIT_DIR->run( status => '--porcelain', $_[0] ) || return;
-    git_commit( @_[1..$#_] );
+  $INNER_GIT_DIR ne ""                                   || return;
+  system("git -C $INNER_GIT_DIR add $_[0]")              || return;
+  `git -C $INNER_GIT_DIR status --porcelain $_[0]` ne "" || return;
+  # git_commit( @_[1..$#_] );
+  git_commit(@_[1..$#_]);
 }
 # }}} git_add_file
 
 # git_commit {{{
 sub git_commit {
-    my $sign = "";
-    $INNER_GIT_DIR ne "" || return;
-    my $tmpo =
-      $INNER_GIT_DIR->run( config => '--bool', '--get', 'pass.signcommits' );
-    $tmpo eq 'true' && ( $sign = '-S' );
-    $INNER_GIT_DIR->run( commit => $sign, '-m', $_[0] );
+  my $sign = "";
+  $INNER_GIT_DIR ne "" || return;
+  $sign = "-S" if (`git -C $INNER_GIT_DIR config --bool --get pass.signcommits` eq 'true');
+  system("git -C $INNER_GIT_DIR commit $sign -m $_[0]");
 }
 # }}} git_commit
 
 # yesno {{{
 sub yesno {
-    say "[y/N]?";
-
-    # FIX: make exit status // -t STDIN
-    -t 0 && chomp( my $ans = <STDIN> );
-    cdie("Exiting: $!") unless $ans =~ /[Yy](es)?/;
+    say "@_ [y/N]?";
+    -t 0 && chomp( my $ans = <STDIN> ); # only execute on terminal
+    cdie("exiting ..") unless $ans =~ /[Yy](es)?/;
 }
 # }}} yesno
+
+# }}} cdie
+sub cdie { die RED "Error: ", RESET @_, "\n"; };
+# }}} cdie
 
 # verify_file {{{
 sub verify_file {
@@ -266,7 +268,9 @@ sub check_sneaky_paths {
 #
 
 # FIX: WHOLE FUNCTION
+# DISCOVER: perl fork crashes launchdaemons
 # clip {{{
+use Proc::Background;
 sub clip {
   my $sleep_argv0 = "password store sleep for user $<";
   # use File::Spec;
@@ -277,36 +281,30 @@ sub clip {
   my $before = encode_base64(pbpaste());
   pbcopy("$_[0]");
   # FIX: disown, setsid
-  local $SIG{HUP} = 'IGNORE';
-  { exec("$sleep_argv0") }; sleep "$CLIP_TIME";
-  my $now = encode_base64(pbpaste());
-  "$now" ne encode_base64("$_[0]") && ( $before = $now );
-  pbcopy(decode_base64($before));
+  # local $SIG{HUP} = 'IGNORE';
+  # { exec("$sleep_argv0") }; sleep "$CLIP_TIME";
+  # my $now = encode_base64(pbpaste());
+  # "$now" ne encode_base64("$_[0]") && ( $before = $now );
+  # pbcopy(decode_base64($before));
   # >/dev/null & disown
+
+    # system("exec -a $sleep_argv0 sleep $CLIP_TIME");
+  # $0 = "$sleep_argv0"; pause;
+  # timeout_system($CLIP_TIME, $sleep_argv0);
+
+  # die "unable to fork: $!" unless defined($pid);
+  # if (!$pid) {  # child
+  #   setpgrp(0, 0);
+  #   # exec("leep 2");
+  #   $0 = "$sleep_argv0"; pause;
+  #   # exec("sleep $CLIP_TIME");
+  #   die "unable to exec: $!";
+  # }
+  # waitpid $pid, 0;
+
   say "Copied $_[1] to the clipboard. Will clear in $CLIP_TIME seconds."
 }
 # }}} clip
-
-use Proc::Background;
-sub c2 {
-  my $sleep_argv0 = "password store sleep for user $<";
-  system("pkill -f $sleep_argv0 2>/dev/null") && sleep 0.5;
-  my $before = encode_base64(pbpaste());
-  pbcopy("$_[0]");
-  # system("exec -a $sleep_argv0 sleep $CLIP_TIME");
-  # $0 = "$sleep_argv0"; pause;
-  # timeout_system($CLIP_TIME, $sleep_argv0);
-  my $pid = fork();
-  die "unable to fork: $!" unless defined($pid);
-  if (!$pid) {  # child
-    setpgrp(0, 0);
-    # exec("leep 2");
-    $0 = "$sleep_argv0"; pause;
-    # exec("sleep $CLIP_TIME");
-    die "unable to exec: $!";
-  }
-  waitpid $pid, 0;
-}
 
 # clip help {{{
 # pkill -f "^$sleep_argv0" 2>/dev/null && sleep 0.5
@@ -397,40 +395,70 @@ sub qrcode {
 my $SHRED = qx(brew --prefix coreutils &>/dev/null && echo "\$(brew --prefix coreutils)/libexec/gnubin/shred" || { which gshred &>/dev/null && echo /usr/local/bin/gshred; } || echo /usr/local/bin/shred );
 # my $BASE64 = qx{openssl base64};
 
-use File::Temp qw{tempfile :mktemp};
-# use sigtrap qw(handler unmount_tmpdir INT TERM EXIT);
-
 # use Sys::Filesystem ();
 # my @filesystems = Sys::Filesystem->filesystems();
 
+sub execute {
+    my $cmd = shift;
+    print "$cmd\n";
+    system($cmd);
+}
+
 # tmpdir {{{
+use File::Temp qw (tempfile tempdir mkdtemp :mktemp);
 sub tmpdir {
+  # return if $SECURE_TMPDIR ne "";
+
   my $tdir = $ENV{'TMPDIR'} // '/tmp';
-  my $SECURE_TMPDIR = File::Temp->newdir("$tdir/$prog.XXXXXX");
+  # my $SECURE_TMPDIR = File::Temp->newdir("$tdir/$prog.XXXXXX");
+  $SECURE_TMPDIR = tempdir("$tdir/passpl.XXXXXXXXXXXXX", CLEANUP => 0);
+  # my $SECURE_TMPDIR = mkdtemp("$tdir/$prog.XXXXXX");
+  # my $SECURE_TMPDIR=qx{mktemp -d $tdir/$prog.XXXXXXXXXXXXX""};
   my $DARWIN_RAMDISK_DEV = qx{hdid -drivekey system-image=yes -nomount 'ram://32768' | cut -d ' ' -f 1};
-  return if $SECURE_TMPDIR eq "";
-  local *unmount_tmpdir = sub {
-    ($SECURE_TMPDIR ne "" && -d $SECURE_TMPDIR && $DARWIN_RAMDISK_DEV ne "") || return;
-    system("umount $SECURE_TMPDIR");
-    system("disutil quiet eject $DARWIN_RAMDISK_DEV");
-    unlink($SECURE_TMPDIR) or cdie("Couldn't delete $SECURE_TMPDIR");
-  };
-  local $SIG{INT} = \&unmount_tmpdir;
-  local $SIG{TERM} = \&unmount_tmpdir;
-  local $SIG{EXIT} = \&unmount_tmpdir;
-  die RED "Error: ", RESET " could not create ramdisk\n" if $DARWIN_RAMDISK_DEV eq "";
-  system("newfs_hfs -M 700 $DARWIN_RAMDISK_DEV &>/dev/null") || cdie("could not create FS on ramdisk");
-  system("mount -t hfs -o noatime -o nobrowse $DARWIN_RAMDISK_DEV $SECURE_TMPDIR") || cdie("could not mount FS on ramdisk");
+
+  # local *unmount_tmpdir = sub {
+  #   ($SECURE_TMPDIR ne "" && -d $SECURE_TMPDIR && $DARWIN_RAMDISK_DEV ne "") || return;
+  #   system("umount $SECURE_TMPDIR");
+  #   system("diskutil quiet eject $DARWIN_RAMDISK_DEV");
+  #   # File::Temp automatically removes
+  #   unlink($SECURE_TMPDIR) or cdie("Couldn't delete $SECURE_TMPDIR");
+  # };
+
+  # local $SIG{INT} = \&unmount_tmpdir;
+  # local $SIG{TERM} = \&unmount_tmpdir;
+  # local END { unmount_tmpdir() };
+  # local $SIG{'EXIT'} = \&unmount_tmpdir;
+  # use sigtrap    qw (handler unmount_tmpdir INT TERM EXIT);
+
+  print RED "DARWIN_RAMDISK_DEV = $DARWIN_RAMDISK_DEV", RESET;
+  say RED "SECURE_TMPDIR = $SECURE_TMPDIR\n\n", RESET;
+
+  cdie("could not CREATE ramdisk") if $DARWIN_RAMDISK_DEV eq "";
+  if (-d $SECURE_TMPDIR) { say 'is dir' };
+
+  # FIX: mounting does not work WTF?
+  # execute("newfs_hfs -M 700 $DARWIN_RAMDISK_DEV");
+  # execute("mount -t hfs -o noatime -o nobrowse $DARWIN_RAMDISK_DEV $SECURE_TMPDIR");
+
+  # system("mount", "-t", hfs -o noatime -o nobrowse $DARWIN_RAMDISK_DEV $SECURE_TMPDIR");
+  system("newfs_hfs -M 700 $DARWIN_RAMDISK_DEV");
+
+  # my @arr = ("mount", "-t hfs", "-o noatime", "-o nobrowse", $DARWIN_RAMDISK_DEV, $SECURE_TMPDIR);
+  # system(@arr);
+
+  # system(shell_quote("mount", "-t hfs", "-o noatime", "-o nobrowse", "$DARWIN_RAMDISK_DEV", "$SECURE_TMPDIR"));
+
+  my $hh = system("mount", "-t hfs", "-o noatime", "$DARWIN_RAMDISK_DEV", "/Users/lucasburns/test");
+  say $hh;
+  # cdie("could not MOUNT FS on ramdisk");
 }
 # }}} tmpdir
 
-# local *prnt = sub {
-#   say colored("=" x screen_len($_[0]) . " $_[0] " . "=" x screen_len($_[0]), "bold $_[1]");
-# };
 
 #
 # }}} === END Platform Specific
 #
+
 
 # version {{{
 sub version {
@@ -452,7 +480,8 @@ sub version {
 
 # cmd_init {{{
 sub cmd_init {
-  my ($id_path, $id_print, %opts, $command);
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
+  my ($id_path, $id_print, %opts);
   # GetOptions("path|p=s" => \my $opts);
   my @init_opts = ("help|h+", "path|p=s");
   GetOptions(\%opts => @init_opts);
@@ -461,13 +490,12 @@ sub cmd_init {
     when(/p|path/) { $id_path = $opts{'path'} }
   };
   # use this in case this sub is called with no args
-  my $command = defined($ARGV[0]) ? shift @ARGV : '';
   cdie(GREEN "Usage: ", RESET "$prog $command [{--path,-p} subfolder] gpg-id") if ((0 == keys (%opts)) || $opts{'help'});
   check_sneaky_paths("$id_path") if $id_path ne "";
   cdie(GREEN "$PREFIX/$id_path ", RESET "exists but is not a directory") if ( $id_path ne "" && !-d "$PREFIX/$id_path" && -e _ );
 
-  # my $gpg_id = "$PREFIX/$id_path/.gpg_id";
-  # set_git("$gpg_id");
+  my $gpg_id = "$PREFIX/$id_path/.gpg_id";
+  set_git("$gpg_id");
   # CHECK: argv[0]
   if (scalar(@ARGV) == 1 && $ARGV[0] eq ''){
     cdie(GREEN "$gpg_id", RESET "does not exist, therefore can't be removed") if (! -f $gpg_id);
@@ -511,16 +539,15 @@ sub cmd_init {
 
 # cmd_show {{{
 sub cmd_show {
-  my (%opts, $selected_line, $command);
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
+  my (%opts, $selected_line);
   my ($clip, $qrcode) = (0, 0);
   my @show_opts = ("clip|c=i", "qrcode|q=i");
   GetOptions(\%opts => @show_opts);
   foreach (keys(%opts)) {
     when(/q|qrcode/) { $selected_line = $opts{'qrcode'} // 1 };
-    when(/c|clip/)   { $selected_line = $opts{'clip'} // 1 };
+    when(/c|clip/)   { $selected_line = $opts{'clip'}   // 1 };
   }
-  # $command = defined($ARGV[0]) ? $ARGV[0] : '';
-  my $command = defined($ARGV[0]) ? shift @ARGV : '';
   cdie(GREEN "Usage: ", RESET "$prog $command [{--clip,-c} line-number] [{--qrcode,-q} line-number] [pass-name]") if ( $? != 0 || ($opts{'qrcode'} && $opts{'clip'}) );
   my $pass;
   my $path = "$ARGV[0]";
@@ -534,9 +561,9 @@ sub cmd_show {
       say decode_base64($pass);
       say 'here';
     } else {
-      cdie("Clip location $selected_line is not a number") unless ($selected_line =~ /^\d+$/);
+      cdie("clip location $selected_line is not a number") unless ($selected_line =~ /^\d+$/);
       $pass = qx{$GPG -d @GPG_OPTS $passfile | tail -n +$selected_line | head -n 1};
-      cdie("There is no password to put on clipboard at $selected_line") if ($pass eq "");
+      cdie("there is no password to put on clipboard at $selected_line") if ($pass eq "");
       if ($opts{'clip'}) {
         clip($pass, $path);
       } elsif ($opts{'qrcode'}) {
@@ -572,28 +599,115 @@ sub cmd_find {
 
 # cmd_grep {{{
 sub cmd_grep {
-  # my $command = defined($ARGV[0]) ? $ARGV[0] : '';
   my $command = defined($ARGV[0]) ? shift @ARGV : '';
-  say $command;
-  # cdie(GREEN, "Usage: ", RESET, "$prog $command [GREPOPTS] pass-names ..") if (scalar(@ARGV) < 1);
-  my ($passfile, $grepresults, @passfiles);
+  cdie(GREEN, "Usage: ", RESET, "$prog $command [GREPOPTS] pass-names ..") if (scalar(@ARGV) < 1);
+  my ($passfile, @passfiles, $passfile_dir, $grepresults);
   local *wanted = sub {
     $File::Find::prune = 1 if /^.git/;
     push(@passfiles, $File::Find::name) if (-f && /^.*\.gpg\z/);
   };
   find( {wanted => \&wanted, follow => 1}, $PREFIX );
 
-  # my $grepresults = qx{$GPG -d @GPG_OPTS $passfile | rg --color=always @ARGV[1..$#_]};
-
-  # my $passfile_dir = (split /\//, $passfile)[-2];
-  # my $passfile_display = (split /\//, $passfile)[-1];
-  # $passfile_display =~ s/\.gpg//;
-
-  # say join "\n", @passfiles;
+  foreach $passfile (@passfiles) {
+    $grepresults = qx{$GPG -d @GPG_OPTS $passfile | rg --color=always @ARGV};
+    next if ($? != 0);
+    $passfile =~ s/(.*)\.gpg/$1/;
+    $passfile =~ s{$PREFIX/}{};
+    # say $passfile;
+    $passfile_dir = $passfile =~ /\// ? (split /\//, $passfile)[-2] . "/" : '';
+    $passfile =~ s{.*/}{};
+    # printf "\e[94m%s\e[1m%s\e[0m:\n", "$passfile_dir", "$passfile";
+    say MAGENTA "${passfile_dir}${passfile}:", RESET;
+    say $grepresults;
+  }
 }
 # }}} cmd_grep
 
-cmd_grep();
+# cmd_insert {{{
+sub cmd_insert {
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
+  my %opts;
+  my @insert_opts = ("multiline|m+", "echo|e+", "force|f+");
+  GetOptions(\%opts => @insert_opts);
+
+  if ($? != 0 || ($opts{'multiline'} && $opts{'echo'}) || scalar(@ARGV) != 1) {
+    cdie(GREEN "Usage:", RESET " $prog $command [--echo,-e | --multiline,-m] [--force,-f] pass-name");
+  }
+
+  my $path = $ARGV[0] =~ s{(.*)/}{$1}r;
+  my $passfile = "$PREFIX/$path.gpg";
+  check_sneaky_paths($path);
+  set_git($passfile);
+
+  ( $opts{'force'} && -e $passfile ) && yesno("An entry already exists for $path.\n", RED "* Overwrite it?", RESET);
+
+  my $path_dir = dirname($path);
+  mkdir("$PREFIX/$path_dir");
+  set_gpg_recipients($path_dir);
+
+  if ( $opts{'multiline'} ) {
+    say "Enter contents of $path & press Ctrl+D when finished:\n";
+    system("$GPG -e @GPG_RECIPIENT_ARGS -o $passfile @GPG_OPTS");
+    # cdie("Password encryption aborted") -- gpg calls error with Ctrl-C
+  } elsif ( !$opts{'echo'} ) {
+    my ($password, $password_again);
+    ReadMode('noecho');
+    say "Enter password for ", YELLOW "$path: ", RESET;
+    $password = ReadLine(0) || exit 1;
+
+    say "Retype password for ", YELLOW "$path: ", RESET;
+    $password_again = ReadLine(0) || exit 1;
+    chomp($password, $password_again);
+
+    if ($password eq $password_again) {
+      system("echo '$password' | $GPG -o $passfile @GPG_RECIPIENT_ARGS @GPG_OPTS -e");
+      say $password;
+    } else {
+      cdie("the entered passwords do not match");
+    }
+    # my ($user, $encrypted) = (getpwuid $< )[0,1];
+    # if (crypt($password, $encrypted) ne $encrypted) {}
+  } else {
+    my $password;
+    say "Enter password for ", YELLOW "$path: ", RESET;
+    $password = ReadLine(0) || exit 1;
+    system("echo '$password' | $GPG -o $passfile @GPG_RECIPIENT_ARGS @GPG_OPTS -e");
+    ReadMode('normal');
+  }
+  # git_add_file($passfile, "Add given password for $path to store");
+  git_add_file($passfile);
+}
+# }}} cmd_insert
+
+# cmd_edit {{{ #
+sub cmd_edit {
+  my $command = defined($ARGV[0]) ? shift @ARGV : '';
+  cdie(GREEN, "Usage: ", RESET, "$prog $command pass-name") if scalar(@ARGV) != 1;
+  # my $path = dirname($ARGV[0]);
+  my $path = $ARGV[0] =~ s{/$}{}r;
+  check_sneaky_paths($path);
+  my $path_dir = dirname($path);
+  mkdir("$PREFIX/$path_dir");
+  set_gpg_recipients($path_dir);
+  my $passfile = "$PREFIX/$path.gpg";
+  set_git($passfile);
+
+  my $tdir = $ENV{'TMPDIR'} // '/tmp';
+  tmpdir();
+  my $tmp_file = tempdir("$tdir/passpl.XXXXXXXXXXXXX", CLEANUP => 0);
+
+  my $action = 'add';
+  if (-f $passfile) {
+    `$GPG -d -o $tmp_file @GPG_OPTS $passfile` || exit 1;
+    $action = 'Edit';
+  }
+
+  my $editor = defined $ENV{'EDITOR'} ? $ENV{'EDITOR'} : 'vi';
+  system("$editor $tmp_file");
+  cdie("new password not saved") unless (-f $tmp_file);
+  cdie("password unsaved") if (`$GPG -d -o - @GPG_OPTS $passfile | diff - $tmp_file &>/dev/null`);
+}
+# }}} cmd_edit #
 
 # exec("pod2usage $0") if ((0 == keys (%opts)) || $opts{'help'});
 # while (my ($k,$v)=each %opts){print "$k $v\n"};
